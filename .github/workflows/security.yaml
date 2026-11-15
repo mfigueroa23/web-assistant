@@ -1,0 +1,276 @@
+name: 'Security'
+
+on:
+  pull_request:
+    branches:
+      - main
+  schedule:
+    - cron: '30 8 * * *'
+  workflow_dispatch:
+  # Only the Release workflow calls it, to scan the image it has just published. The code jobs are
+  # skipped: that code already passed this workflow in its PR to main.
+  workflow_call:
+    inputs:
+      image:
+        description: 'Published image to scan, by digest (organization/image@sha256:...)'
+        type: string
+        required: true
+    secrets:
+      DOCKERHUB_TOKEN:
+        required: true
+
+permissions:
+  contents: read
+
+# Only a PR cancels its older runs; scheduled, manual and release runs always finish.
+concurrency:
+  group: security-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  # Reports every finding to Security > Code scanning and fails only on critical or high ones
+  # (security-severity >= 7.0).
+  codeql:
+    name: 'SAST (CodeQL)'
+    if: ${{ !inputs.image }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - name: 'Checkout Code'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: 'Initialize CodeQL'
+        uses: github/codeql-action/init@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
+        with:
+          languages: python, actions
+          build-mode: none
+          queries: security-extended
+          config: |
+            paths-ignore:
+              - tests
+              - alembic/versions
+
+      - name: 'Analyze Code'
+        uses: github/codeql-action/analyze@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
+        with:
+          output: ${{ runner.temp }}/codeql
+
+      - name: 'Check Critical and High'
+        env:
+          SARIF_DIR: ${{ runner.temp }}/codeql
+        run: |
+          jq -rs '.[].runs[]
+            | ([.tool.driver.rules[]?, .tool.extensions[]?.rules[]?]
+               | map({(.id): (.properties["security-severity"] // "0" | tonumber)}) | add // {}) as $severity
+            | .results[]
+            | select(($severity[.ruleId] // 0) >= 7)
+            | .locations[0].physicalLocation as $location
+            | "::error file=\($location.artifactLocation.uri),line=\($location.region.startLine)::\(.ruleId): \(.message.text | gsub("\n"; " "))"' \
+            "$SARIF_DIR"/*.sarif > blocking.txt
+          cat blocking.txt
+          if [ -s blocking.txt ]; then
+            echo "::error::CodeQL found $(wc -l < blocking.txt) critical or high findings"
+            exit 1
+          fi
+
+  # Bugs, code smells, vulnerabilities and test coverage. The step fails when the Quality Gate
+  # does not pass (sonar.qualitygate.wait in sonar-project.properties).
+  sonar:
+    name: 'SAST (SonarQube Cloud)'
+    if: ${{ !inputs.image }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      # Full history: Sonar uses the blame to tell new code from old code.
+      - name: 'Checkout Code'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: 'Install uv and Python'
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version: 0.13.7
+          cache-python: true
+
+      - name: 'Install Dependencies'
+        run: uv sync --locked
+
+      # Settings requires the DB_* variables on import; the tests never connect to the database.
+      - name: 'Tests with Coverage'
+        env:
+          DB_HOST: localhost
+          DB_PORT: 5432
+          DB_USER: test
+          DB_PASSWORD: test
+          DB_NAME: test
+        run: uv run pytest --cov --cov-report=xml
+
+      - name: 'Scan Code'
+        uses: SonarSource/sonarqube-scan-action@59202af334b4ba7b5db01b701b8e79f8b3bef0f4 # v8.5.0
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+
+  # Every dependency in uv.lock, production and development, against OSV.dev. Reports all
+  # findings to Security > Code scanning and fails only on critical or high ones. Accepted
+  # vulnerabilities go in osv-scanner.toml with a reason and an effectiveUntil date.
+  osv:
+    name: 'SCA (OSV-Scanner)'
+    if: ${{ !inputs.image }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      security-events: write
+    env:
+      OSV_SCANNER_IMAGE: ghcr.io/google/osv-scanner:v2.7.1@sha256:a70ffffc2bfd33482953e5d6b64c6fcdb30239717a07b0f0d3ab2859ce3e4cde
+    steps:
+      - name: 'Checkout Code'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # The repository is mounted at the runner's own path so the SARIF file URIs match the
+      # checkout. Exit code 1 means vulnerabilities were found (checked below); any other non-zero
+      # code is a scan error.
+      - name: 'Scan Dependencies'
+        env:
+          SARIF_FILE: ${{ runner.temp }}/osv/results.sarif
+        run: |
+          mkdir -p "$(dirname "$SARIF_FILE")"
+          status=0
+          docker run --rm \
+            -v "$GITHUB_WORKSPACE:$GITHUB_WORKSPACE:ro" \
+            -v "$(dirname "$SARIF_FILE"):$(dirname "$SARIF_FILE")" \
+            -w "$GITHUB_WORKSPACE" \
+            "$OSV_SCANNER_IMAGE" scan source --recursive --format sarif --output-file "$SARIF_FILE" ./ \
+            || status=$?
+          if [ "$status" -gt 1 ]; then
+            echo "::error::OSV-Scanner failed with exit code $status"
+            exit "$status"
+          fi
+
+      - name: 'Upload Results'
+        uses: github/codeql-action/upload-sarif@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
+        with:
+          sarif_file: ${{ runner.temp }}/osv/results.sarif
+          category: osv-scanner
+
+      - name: 'Check Critical and High'
+        env:
+          SARIF_FILE: ${{ runner.temp }}/osv/results.sarif
+        run: |
+          jq -r --arg root "$GITHUB_WORKSPACE" '.runs[]
+            | ([.tool.driver.rules[]?] | map({(.id): (.properties["security-severity"] // "0" | tonumber)}) | add // {}) as $severity
+            | .results[]
+            | select(($severity[.ruleId] // 0) >= 7)
+            | (.locations[0].physicalLocation.artifactLocation.uri | ltrimstr("file://" + $root + "/")) as $file
+            | "::error file=\($file)::\(.ruleId): \(.message.text | gsub("\n"; " "))"' \
+            "$SARIF_FILE" > blocking.txt
+          cat blocking.txt
+          if [ -s blocking.txt ]; then
+            echo "::error::OSV-Scanner found $(wc -l < blocking.txt) critical or high vulnerabilities"
+            exit 1
+          fi
+
+  # Only on PRs: blocks a change that adds or updates a dependency with a high or critical
+  # advisory, in production or development, and summarizes every dependency change in the job.
+  dependency-review:
+    name: 'SCA (Dependency Review)'
+    if: ${{ github.event_name == 'pull_request' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: 'Review Dependency Changes'
+        uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0
+        with:
+          fail-on-severity: high
+          fail-on-scopes: runtime, development
+
+  # Docker Scout on the image. Reports every CVE to Security > Code scanning and fails only on
+  # critical or high ones that the VEX statements in .github/vex do not mark as not affected.
+  #   - pull_request: the image built from the PR code, amd64 only.
+  #   - workflow_call: the exact image the release published, every platform.
+  #   - schedule and workflow_dispatch: the published :latest, every platform.
+  image:
+    name: 'Image Analysis (Docker Scout, ${{ matrix.platform }})'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      security-events: write
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: ${{ fromJSON(github.event_name == 'pull_request' && '["linux/amd64"]' || '["linux/amd64", "linux/arm64"]') }}
+    steps:
+      # Always checked out: the VEX statements in .github/vex apply to every scan.
+      - name: 'Checkout Code'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: 'Resolve Image'
+        id: image
+        env:
+          INPUT_IMAGE: ${{ inputs.image }}
+          LATEST_IMAGE: ${{ vars.DOCKERHUB_ORGANIZATION }}/${{ vars.DOCKER_IMAGE }}:latest
+        run: |
+          if [ -n "$INPUT_IMAGE" ]; then
+            echo "ref=registry://$INPUT_IMAGE" >> "$GITHUB_OUTPUT"
+          elif [ "$GITHUB_EVENT_NAME" = 'pull_request' ]; then
+            echo "ref=local://web-assistant:scan" >> "$GITHUB_OUTPUT"
+          else
+            echo "ref=registry://$LATEST_IMAGE" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: 'Build Image'
+        if: ${{ github.event_name == 'pull_request' }}
+        run: docker build -t web-assistant:scan .
+
+      - name: 'Report All Vulnerabilities'
+        uses: docker/scout-action@e7e2a72bf1485d10a58f30696b6c513b261ce4fa # v1.29.0
+        with:
+          command: cves
+          image: ${{ steps.image.outputs.ref }}
+          platform: ${{ matrix.platform }}
+          organization: ${{ vars.DOCKERHUB_ORGANIZATION }}
+          dockerhub-user: ${{ vars.DOCKERHUB_USERNAME }}
+          dockerhub-password: ${{ secrets.DOCKERHUB_TOKEN }}
+          registry-user: ${{ vars.DOCKERHUB_USERNAME }}
+          registry-password: ${{ secrets.DOCKERHUB_TOKEN }}
+          vex-location: .github/vex
+          vex-author: mfigueroa23
+          sarif-file: scout.sarif
+          write-comment: false
+          exit-code: false
+
+      - name: 'Upload Results'
+        uses: github/codeql-action/upload-sarif@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
+        with:
+          sarif_file: scout.sarif
+          category: docker-scout-${{ matrix.platform }}
+
+      - name: 'Check Critical and High'
+        uses: docker/scout-action@e7e2a72bf1485d10a58f30696b6c513b261ce4fa # v1.29.0
+        with:
+          command: cves
+          image: ${{ steps.image.outputs.ref }}
+          platform: ${{ matrix.platform }}
+          organization: ${{ vars.DOCKERHUB_ORGANIZATION }}
+          dockerhub-user: ${{ vars.DOCKERHUB_USERNAME }}
+          dockerhub-password: ${{ secrets.DOCKERHUB_TOKEN }}
+          registry-user: ${{ vars.DOCKERHUB_USERNAME }}
+          registry-password: ${{ secrets.DOCKERHUB_TOKEN }}
+          only-severities: critical,high
+          vex-location: .github/vex
+          vex-author: mfigueroa23
+          summary: false
+          write-comment: false
+          exit-code: true
