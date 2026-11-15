@@ -1,0 +1,246 @@
+name: 'Release'
+
+# Testing and Security are not repeated here: main only accepts PRs that passed both (ruleset on
+# main). The release only scans the image it publishes, which the PR never built.
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+# A newer push waits for the running release instead of cancelling it mid-deployment.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+env:
+  REPOSITORY: ${{ vars.DOCKERHUB_ORGANIZATION }}/${{ vars.DOCKER_IMAGE }}
+
+jobs:
+  # Each platform is built on its native runner: pyyaml, zstandard and websockets are compiled for
+  # Python 3.15 and under QEMU that took the build from ~8 to ~25 minutes. Each image is pushed by
+  # digest only, without a tag; the merge job joins them in one index.
+  package:
+    name: 'Package Image (${{ matrix.arch }})'
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - name: 'Checkout Code'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: 'Login to Docker Hub'
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        with:
+          username: ${{ vars.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: 'Set up Buildx'
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      # The layer cache keeps the compiled dependencies while uv.lock does not change.
+      - name: 'Build & Push Image'
+        id: build
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          platforms: linux/${{ matrix.arch }}
+          outputs: type=image,name=${{ env.REPOSITORY }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=release-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=release-${{ matrix.arch }}
+
+      - name: 'Export Digest'
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/digests"
+          touch "$RUNNER_TEMP/digests/${DIGEST#sha256:}"
+
+      - name: 'Upload Digest'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: digest-${{ matrix.arch }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  # Pushed only as sha-<commit>: the version and latest tags are added once the image passes the
+  # scan, so an image with critical or high CVEs is never published under them.
+  merge:
+    name: 'Push Image Index'
+    needs: package
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      digest: ${{ steps.index.outputs.digest }}
+    steps:
+      - name: 'Download Digests'
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: digest-*
+          path: ${{ runner.temp }}/digests
+          merge-multiple: true
+
+      - name: 'Login to Docker Hub'
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        with:
+          username: ${{ vars.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: 'Set up Buildx'
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: 'Create Multi-Platform Index'
+        id: index
+        working-directory: ${{ runner.temp }}/digests
+        run: |
+          docker buildx imagetools create \
+            --tag "$REPOSITORY:sha-$GITHUB_SHA" \
+            $(printf "$REPOSITORY@sha256:%s " *)
+          digest=$(docker buildx imagetools inspect "$REPOSITORY:sha-$GITHUB_SHA" --format '{{.Manifest.Digest}}')
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+
+  scan:
+    name: 'Image Analysis'
+    needs: merge
+    uses: ./.github/workflows/security.yaml
+    permissions:
+      contents: read
+      security-events: write
+    with:
+      image: ${{ vars.DOCKERHUB_ORGANIZATION }}/${{ vars.DOCKER_IMAGE }}@${{ needs.merge.outputs.digest }}
+    # Only the secret Docker Scout needs, never every repository secret.
+    secrets:
+      DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+
+  # Adds the version and latest tags to the scanned image without rebuilding it. A published
+  # version is never moved: if X.Y.Z already points to another image, the version in pyproject.toml
+  # was not bumped and the release stops before deploying.
+  promote:
+    name: 'Tag Image'
+    needs:
+      - merge
+      - scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: 'Checkout Code'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: 'Login to Docker Hub'
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        with:
+          username: ${{ vars.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: 'Set up Buildx'
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: 'Check Version Is Not Published'
+        id: version
+        env:
+          DIGEST: ${{ needs.merge.outputs.digest }}
+        run: |
+          version=$(python3 -c "import tomllib; print(tomllib.load(open('pyproject.toml', 'rb'))['project']['version'])")
+          echo "value=$version" >> "$GITHUB_OUTPUT"
+          if ! published=$(docker buildx imagetools inspect "$REPOSITORY:$version" --format '{{.Manifest.Digest}}' 2>&1); then
+            if echo "$published" | grep -q 'not found'; then
+              exit 0
+            fi
+            echo "$published"
+            exit 1
+          fi
+          if [ "$published" != "$DIGEST" ]; then
+            echo "::error::$REPOSITORY:$version is already published. Bump the version with uv version --bump <major|minor|patch>."
+            exit 1
+          fi
+
+      - name: 'Tag Version and Latest'
+        env:
+          DIGEST: ${{ needs.merge.outputs.digest }}
+          VERSION: ${{ steps.version.outputs.value }}
+        run: |
+          docker buildx imagetools create \
+            "$REPOSITORY@$DIGEST" \
+            --tag "$REPOSITORY:$VERSION" \
+            --tag "$REPOSITORY:latest"
+
+  # Runs only once the image is tagged and before it is deployed. During the rollout the previous
+  # version runs on the new schema, so migrations must be backward compatible. The advisory lock in
+  # alembic/env.py keeps two runs from migrating at the same time.
+  migrate:
+    name: 'Database Migrations'
+    needs: promote
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: 'Checkout Code'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Same uv as the Dockerfile's uv stage. Python comes from .python-version.
+      - name: 'Install uv and Python'
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version: 0.13.7
+          cache-python: true
+
+      - name: 'Install Dependencies'
+        run: uv sync --locked --no-dev
+
+      - name: 'Connect to Cluster Network'
+        uses: twingate/github-action@358e205bb31e636fef1dfb706228ab60eb90c181 # v1.11
+        with:
+          service-key: ${{ secrets.TWINGATE_SERVICE_KEY }}
+
+      - name: 'Apply Migrations'
+        env:
+          DB_HOST: ${{ secrets.DB_HOST }}
+          DB_PORT: ${{ secrets.DB_PORT }}
+          DB_USER: ${{ secrets.DB_USER }}
+          DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
+          DB_NAME: ${{ secrets.DB_NAME }}
+        run: uv run --no-sync alembic upgrade head
+
+  # The production environment records each release under Deployments and holds KUBE_CONFIG, which
+  # only this job (and only from main) can read.
+  deploy:
+    name: 'Deploy to Kubernetes'
+    needs:
+      - merge
+      - migrate
+    environment:
+      name: production
+      url: https://agent.figueroa-sanchez.com
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: 'Connect to Cluster Network'
+        uses: twingate/github-action@358e205bb31e636fef1dfb706228ab60eb90c181 # v1.11
+        with:
+          service-key: ${{ secrets.TWINGATE_SERVICE_KEY }}
+
+      # Deployed by digest, so the cluster runs exactly the image this release built and scanned.
+      - name: 'Deploy Image'
+        env:
+          KUBE_CONFIG: ${{ secrets.KUBE_CONFIG }}
+          IMAGE: ${{ env.REPOSITORY }}@${{ needs.merge.outputs.digest }}
+        run: |
+          export KUBECONFIG="$RUNNER_TEMP/kubeconfig"
+          (umask 077 && printf '%s' "$KUBE_CONFIG" > "$KUBECONFIG")
+          kubectl set image deployment/web web="$IMAGE" -n virtual-assistant
+          kubectl rollout status deployment/web -n virtual-assistant --timeout=5m
