@@ -72,3 +72,16 @@ def test_every_vex_statement_justifies_why_the_image_is_not_affected():
         for statement in document["statements"]:
             assert statement["status"] == "not_affected"
             assert statement["justification"] and statement["impact_statement"]
+
+
+def test_vex_statements_accept_the_unfixed_openssl_cves():
+    # Remove this test with the statements once Alpine 3.24 ships openssl 3.5.9-r1.
+    product = "pkg:apk/alpine/openssl@3.5.9-r0?os_name=alpine&os_version=3.24"
+    for cve in ("CVE-2026-107496", "CVE-2026-88822", "CVE-2026-88823", "CVE-2026-95691", "CVE-2026-95692"):
+        document = json.loads((ROOT / ".github" / "vex" / f"{cve}.json").read_text())
+        assert document["@id"].endswith(f"/.github/vex/{cve}.json")
+        [statement] = document["statements"]
+        assert statement["vulnerability"]["name"] == cve
+        assert statement["products"] == [{"@id": product}]
+        assert statement["justification"] == "vulnerable_code_not_in_execute_path"
+        assert "openssl 3.5.9-r1" in statement["impact_statement"]
